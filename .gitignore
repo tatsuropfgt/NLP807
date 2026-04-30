@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Generated outputs / personal notes
+examples/
+docs/
+runs/
+
+# Exploratory / legacy scripts (subsumed by run_seed_full.sh; kept locally
+# for reference but not part of the canonical replication pipeline).
+scripts/run_bcd.sh
+scripts/run_intact_v2.sh
+scripts/run_intact_40k.sh
+scripts/sweep_intact_40k_ckpts.sh
+
+# Notebook execution byproducts
+notebooks/.ipynb_checkpoints/
