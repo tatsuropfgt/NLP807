@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
-# Run the entire pipeline (5 pretrains + 6 conditions x 3 probe tasks) for
+# Run the entire pipeline (5 pretrains + 6 conditions x 5 probe tasks) for
 # a single seed. Output goes to runs/seed<SEED>/<cond>/, leaving the
 # existing default-seed runs at runs/<cond>/ untouched.
+#
+# Probe tasks:
+#   phone, boundary, f0 — frame-level (LibriSpeech + MFA / F0)
+#   ks, sid             — utterance-level (Speech Commands v1, VoxCeleb1)
 #
 # Skip-existing safe at every step (per-pretrain via summary.json, per-probe
 # via best_metrics.json). Re-invoking will pick up where things stopped.
@@ -29,6 +33,9 @@ RUNS_BASE=/workspace/i_tatsuro/projects/music2speech/runs/${SUFFIX}
 LIBRI_ROOT=/workspace/i_tatsuro/data/LibriSpeech/LibriSpeech
 ALIGN_ROOT=/workspace/i_tatsuro/data/LibriSpeech/alignments/LibriSpeech
 F0_ROOT=/workspace/i_tatsuro/data/LibriSpeech/f0
+SC_ROOT=/workspace/i_tatsuro/data/SpeechCommands
+VOX_WAV_DIR=/workspace/i_tatsuro/data/VoxCeleb1/wav
+VOX_SPLIT=/workspace/i_tatsuro/data/VoxCeleb1/iden_split.txt
 
 # (condition, render_dir) for the 5 pretrain conditions.
 PRETRAIN_CONDS=(intact pitch_strip rhythm_strip both_strip esc50)
@@ -42,20 +49,35 @@ declare -A COND_DATA=(
 
 # All 6 conditions evaluated downstream (random_init = no encoder).
 ALL_CONDS=(intact pitch_strip rhythm_strip both_strip esc50 random_init)
-ALL_TASKS=(phone boundary f0)
+ALL_TASKS=(phone boundary f0 ks sid)
 
 probe_module() {
     case "$1" in
         phone)    echo "src.eval.train_probe" ;;
         boundary) echo "src.eval.train_boundary_probe" ;;
         f0)       echo "src.eval.train_f0_probe" ;;
+        ks)       echo "src.eval.train_ks_probe" ;;
+        sid)      echo "src.eval.train_sid_probe" ;;
     esac
 }
 
-probe_label_args() {
+# Per-task data args. Frame-level probes share --librispeech-root + label root;
+# utterance-level probes have their own dataset roots.
+probe_data_args() {
     case "$1" in
-        phone|boundary) echo "--alignments-root ${ALIGN_ROOT}" ;;
-        f0)             echo "--f0-root ${F0_ROOT}" ;;
+        phone|boundary) echo "--librispeech-root ${LIBRI_ROOT} --alignments-root ${ALIGN_ROOT}" ;;
+        f0)             echo "--librispeech-root ${LIBRI_ROOT} --f0-root ${F0_ROOT}" ;;
+        ks)             echo "--data-root ${SC_ROOT}" ;;
+        sid)            echo "--wav-dir ${VOX_WAV_DIR} --split-file ${VOX_SPLIT}" ;;
+    esac
+}
+
+probe_batch_size() {
+    # Frame-level probes use long utterances (~16 s capped) at bs=8;
+    # utterance-level probes use 1–3 s crops and fit bs=32.
+    case "$1" in
+        phone|boundary|f0) echo 8 ;;
+        ks|sid)            echo 32 ;;
     esac
 }
 
@@ -128,18 +150,18 @@ for COND in "${ALL_CONDS[@]}"; do
         fi
 
         MODULE=$(probe_module "${TASK}")
-        EXTRA=$(probe_label_args "${TASK}")
+        DATA_ARGS=$(probe_data_args "${TASK}")
+        BS=$(probe_batch_size "${TASK}")
 
         echo
         echo "=== Probe ${COND}/${TASK} (${SUFFIX}) ==="
         # shellcheck disable=SC2086
         uv run python -m "${MODULE}" \
             ${CKPT_ARG} \
-            --librispeech-root "${LIBRI_ROOT}" \
-            ${EXTRA} \
+            ${DATA_ARGS} \
             --output-dir "${OUT}" \
             --max-steps 10000 \
-            --batch-size 8 \
+            --batch-size "${BS}" \
             --wandb --wandb-run-name "probe_${TASK}_${COND}_${SUFFIX}"
     done
 done
@@ -148,5 +170,5 @@ echo
 echo "########################################################"
 echo "# Done: ${SUFFIX}"
 echo "# Pretrains in: ${RUNS_BASE}/{intact,pitch_strip,rhythm_strip,both_strip,esc50}/"
-echo "# Probes in:    ${RUNS_BASE}/{...}/probe_{phone,boundary,f0}/"
+echo "# Probes in:    ${RUNS_BASE}/{...}/probe_{phone,boundary,f0,ks,sid}/"
 echo "########################################################"

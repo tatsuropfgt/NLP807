@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Run phoneme / boundary / F0 probes across multiple encoder conditions.
+# Run downstream probes across multiple encoder conditions.
 # Designed to be invokable on each GPU in parallel: set CUDA_VISIBLE_DEVICES
 # and CONDITIONS to split work between GPUs. Skips probes whose
 # best_metrics.json already exists, so re-invoking is safe.
 #
+# Frame-level tasks: phone, boundary, f0   (LibriSpeech + MFA / F0)
+# Utterance-level tasks: ks, sid           (Speech Commands v1, VoxCeleb1)
+#
 # Usage examples:
-#   # All conditions, all 3 tasks, on GPU 0:
+#   # All conditions, all 5 tasks, on GPU 0:
 #   CUDA_VISIBLE_DEVICES=0 bash scripts/run_all_probes.sh
 #
 #   # Split across 2 GPUs:
@@ -20,7 +23,7 @@
 # Required env (have defaults):
 #   CONDITIONS  - space-separated subset of:
 #                 intact pitch_strip rhythm_strip both_strip esc50 random_init
-#   TASKS       - space-separated subset of: phone boundary f0
+#   TASKS       - space-separated subset of: phone boundary f0 ks sid
 #   PROBE_STEPS - max-steps for each probe (default 10000)
 
 set -euo pipefail
@@ -28,12 +31,15 @@ cd "$(dirname "$0")/.."
 unset VIRTUAL_ENV || true
 
 CONDITIONS=${CONDITIONS:-"intact pitch_strip rhythm_strip both_strip esc50 random_init"}
-TASKS=${TASKS:-"phone boundary f0"}
+TASKS=${TASKS:-"phone boundary f0 ks sid"}
 PROBE_STEPS=${PROBE_STEPS:-10000}
 
 LIBRI_ROOT=/workspace/i_tatsuro/data/LibriSpeech/LibriSpeech
 ALIGN_ROOT=/workspace/i_tatsuro/data/LibriSpeech/alignments/LibriSpeech
 F0_ROOT=/workspace/i_tatsuro/data/LibriSpeech/f0
+SC_ROOT=/workspace/i_tatsuro/data/SpeechCommands
+VOX_WAV_DIR=/workspace/i_tatsuro/data/VoxCeleb1/wav
+VOX_SPLIT=/workspace/i_tatsuro/data/VoxCeleb1/iden_split.txt
 RUNS_BASE=/workspace/i_tatsuro/projects/music2speech/runs
 
 # Map condition -> encoder path (empty string = random init).
@@ -87,19 +93,35 @@ run_probe() {
         ckpt_arg="--encoder-ckpt $ckpt"
     fi
 
-    local module label_args
+    # Per-task module, data args, and batch size. Frame-level probes use
+    # batch_size=8 (long utterances); utterance-level probes use 32+ since
+    # 1 s / 3 s crops fit easily.
+    local module data_args batch_size
     case "$task" in
         phone)
             module="src.eval.train_probe"
-            label_args="--alignments-root ${ALIGN_ROOT}"
+            data_args="--librispeech-root ${LIBRI_ROOT} --alignments-root ${ALIGN_ROOT}"
+            batch_size=8
             ;;
         boundary)
             module="src.eval.train_boundary_probe"
-            label_args="--alignments-root ${ALIGN_ROOT}"
+            data_args="--librispeech-root ${LIBRI_ROOT} --alignments-root ${ALIGN_ROOT}"
+            batch_size=8
             ;;
         f0)
             module="src.eval.train_f0_probe"
-            label_args="--f0-root ${F0_ROOT}"
+            data_args="--librispeech-root ${LIBRI_ROOT} --f0-root ${F0_ROOT}"
+            batch_size=8
+            ;;
+        ks)
+            module="src.eval.train_ks_probe"
+            data_args="--data-root ${SC_ROOT}"
+            batch_size=32
+            ;;
+        sid)
+            module="src.eval.train_sid_probe"
+            data_args="--wav-dir ${VOX_WAV_DIR} --split-file ${VOX_SPLIT}"
+            batch_size=32
             ;;
         *)
             echo "[skip] unknown task: $task"
@@ -115,11 +137,10 @@ run_probe() {
     # shellcheck disable=SC2086
     uv run python -m "${module}" \
         ${ckpt_arg} \
-        --librispeech-root "${LIBRI_ROOT}" \
-        ${label_args} \
+        ${data_args} \
         --output-dir "${out}" \
         --max-steps "${PROBE_STEPS}" \
-        --batch-size 8 \
+        --batch-size "${batch_size}" \
         --wandb --wandb-run-name "probe_${task}_${cond}"
 }
 

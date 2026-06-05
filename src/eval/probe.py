@@ -1,7 +1,11 @@
-"""Linear probe head over a frozen audio encoder.
+"""Linear probe heads over a frozen audio encoder.
 
 For SUPERB-style frozen evaluation: the encoder's weights are not updated;
-only a single linear classifier is trained on top of the per-frame features.
+only a single linear classifier is trained on top of the encoder features.
+Two variants are provided:
+- :class:`FrozenLinearProbe` — per-frame linear (phoneme cls, boundary, F0).
+- :class:`FrozenUtteranceProbe` — masked mean-pool over time, then linear
+  (KS, SID, ER — any utterance-level classification).
 """
 
 from __future__ import annotations
@@ -47,6 +51,52 @@ class FrozenLinearProbe(nn.Module):
     def forward(self, wav: torch.Tensor) -> torch.Tensor:
         feats = self.features(wav)  # (B, T, d_model)
         return self.head(feats)  # (B, T, n_classes)
+
+
+class FrozenUtteranceProbe(nn.Module):
+    """Frozen encoder + masked mean-pool + linear classification head.
+
+    Forward expects a wav batch ``(B, T_wav)`` plus ``wav_lens (B,)`` giving
+    the valid sample count per item; padded frames are masked out of the mean
+    pool. ``wav_lens`` is required: SUPERB-style utterance tasks pad to the
+    longest in the batch and silently averaging the zero pad would skew
+    short utterances.
+    """
+
+    def __init__(
+        self,
+        encoder: MelTransformerEncoder,
+        n_classes: int,
+        hop_length: int = 160,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        for p in self.encoder.parameters():
+            p.requires_grad = False
+        self.encoder.eval()
+        self.head = nn.Linear(encoder.d_model, n_classes)
+        self.hop_length = hop_length
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self.encoder.eval()
+        return self
+
+    @torch.no_grad()
+    def features(self, wav: torch.Tensor) -> torch.Tensor:
+        return self.encoder(wav)  # (B, T_frames, d_model)
+
+    def forward(self, wav: torch.Tensor, wav_lens: torch.Tensor) -> torch.Tensor:
+        feats = self.features(wav)  # (B, T, d)
+        T = feats.shape[1]
+        # MelSpectrogram(center=True): frame_count = floor(n_samples/hop) + 1
+        frame_lens = (wav_lens // self.hop_length + 1).clamp(min=1, max=T)
+        idx = torch.arange(T, device=feats.device).unsqueeze(0)
+        mask = (idx < frame_lens.unsqueeze(1)).to(feats.dtype).unsqueeze(-1)  # (B, T, 1)
+        summed = (feats * mask).sum(dim=1)
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        pooled = summed / denom  # (B, d)
+        return self.head(pooled)  # (B, n_classes)
 
 
 def load_encoder(

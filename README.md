@@ -19,11 +19,19 @@ POP909 is manipulated at the MIDI stage and rendered through a shared synthesis 
 
 ### Downstream tasks
 
-| Hypothesis | Task | Label | Metric |
-|---|---|---|---|
-| Pitch transfer | F0 tracking | LibriSpeech audio + pyworld-extracted F0 | RMSE [cents] (↓) |
-| Rhythm transfer | Phoneme boundary | Binarized "frame where the phoneme changes" from TextGrid | F1 (↑) |
-| Integrated capability | Phoneme classification | TextGrid + CMU 40 phonemes (incl. SIL) | frame accuracy (↑) |
+| Axis | Task | Data | Granularity | Metric |
+|---|---|---|---|---|
+| Pitch | F0 tracking | LibriSpeech + pyworld F0 | frame | RMSE [cents] (↓) |
+| Rhythm | Phoneme boundary | LibriSpeech + MFA TextGrid | frame | F1 (↑) |
+| Integrated | Phoneme classification | LibriSpeech + MFA TextGrid (CMU 40 phones incl. SIL) | frame | accuracy (↑) |
+| Integrated | Keyword spotting (KS) | Speech Commands v1 (10 keywords + unknown + silence) | utt | accuracy (↑) |
+| Timbre | Speaker ID (SID) | VoxCeleb1, SUPERB iden_split (1251 speakers) | utt | accuracy (↑) |
+
+The last two follow the [SUPERB](https://superbbenchmark.org/) protocol
+(Speech Commands v0.01 with 12 classes; VoxCeleb1 with `iden_split.txt`).
+Frame-level probes use a per-frame linear head; utterance-level probes use a
+masked mean-pool followed by a single linear classifier. ER (IEMOCAP) is
+planned once the official license arrives.
 
 ## Data layout
 
@@ -33,6 +41,8 @@ POP909 is manipulated at the MIDI stage and rendered through a shared synthesis 
 | ESC-50 raw audio | `/workspace/i_tatsuro/data/ESC-50/ESC-50-master/audio/` |
 | LibriSpeech | `/workspace/i_tatsuro/data/LibriSpeech/LibriSpeech/{train-clean-100,dev-clean,test-clean}/` |
 | MFA TextGrid | `/workspace/i_tatsuro/data/LibriSpeech/alignments/LibriSpeech/<split>/<spk>/<chap>/<utt>.TextGrid` |
+| Speech Commands v1 | `/workspace/i_tatsuro/data/SpeechCommands/` (downloadable via prepare script) |
+| VoxCeleb1 | `/workspace/i_tatsuro/data/VoxCeleb1/` (parts + `iden_split.txt`; registration required) |
 
 The time-signature meta inside POP909 MIDI is unreliable. The list of triple-meter tracks is hardcoded in [src/data/midi_ops.py](src/data/midi_ops.py) and [src/data/generate_examples.py](src/data/generate_examples.py).
 `align_mid` uses a version of the original [MIDI data](https://github.com/music-x-lab/POP909-Dataset) that we lightly preprocessed ourselves. A processed copy is committed under [align_mid/](align_mid/) for reproducibility.
@@ -73,11 +83,23 @@ done
 
 # Extract F0 with pyworld (10ms hop)
 uv run python -m src.data.extract_f0 --workers 8
+
+# Speech Commands v1 (KS probe): downloads ~1.5 GB tarball and extracts
+uv run python -m src.data.prepare_speech_commands \
+  --output-dir /workspace/i_tatsuro/data/SpeechCommands
+
+# VoxCeleb1 (SID probe): requires registration on the VGG site to get
+# the dev/test zip parts. Place the parts under --input-dir, then:
+uv run python -m src.data.prepare_voxceleb \
+  --input-dir /workspace/i_tatsuro/data/VoxCeleb1 \
+  --output-dir /workspace/i_tatsuro/data/VoxCeleb1
+# This concatenates the dev parts, extracts dev+test into wav/, and
+# downloads iden_split.txt from the VGG meta URL.
 ```
 
 ### 2. Full pipeline
 
-3 seeds × (5 pretrain + 18 probe) in one go:
+3 seeds × (5 pretrain + 30 probe) in one go (5 tasks × 6 conditions):
 
 ```bash
 for SEED in 42 43 44; do
@@ -86,7 +108,8 @@ done
 # Output: runs/seed42/<cond>/{encoder.pt, probe_*/best_metrics.json}, ...
 ```
 
-~5–6 hours per seed on a single GPU.
+~5–6 hours per seed on a single GPU for the original 3 tasks; KS and SID
+add roughly another 1 h combined.
 
 ### Optional. Individual runs (for debugging)
 
@@ -104,14 +127,18 @@ uv run python -m src.pretrain.train \
 
 `encoder.pt` is automatically promoted to the best-val weights.
 
-#### Probes (3 types)
+#### Probes (5 types)
 
 ```bash
 LIBRI=/workspace/i_tatsuro/data/LibriSpeech/LibriSpeech
 ALIGN=/workspace/i_tatsuro/data/LibriSpeech/alignments/LibriSpeech
 F0=/workspace/i_tatsuro/data/LibriSpeech/f0
+SC=/workspace/i_tatsuro/data/SpeechCommands
+VOX_WAV=/workspace/i_tatsuro/data/VoxCeleb1/wav
+VOX_SPLIT=/workspace/i_tatsuro/data/VoxCeleb1/iden_split.txt
 CKPT=runs/intact/encoder.pt   # for random init, omit --encoder-ckpt
 
+# Frame-level (LibriSpeech)
 uv run python -m src.eval.train_probe \
   --encoder-ckpt $CKPT --librispeech-root $LIBRI --alignments-root $ALIGN \
   --output-dir runs/intact/probe_phone --max-steps 10000 --batch-size 8
@@ -124,6 +151,15 @@ uv run python -m src.eval.train_boundary_probe \
 uv run python -m src.eval.train_f0_probe \
   --encoder-ckpt $CKPT --librispeech-root $LIBRI --f0-root $F0 \
   --output-dir runs/intact/probe_f0 --max-steps 10000 --batch-size 8
+
+# Utterance-level (SUPERB-style: masked mean-pool + linear head)
+uv run python -m src.eval.train_ks_probe \
+  --encoder-ckpt $CKPT --data-root $SC \
+  --output-dir runs/intact/probe_ks --max-steps 10000 --batch-size 32
+
+uv run python -m src.eval.train_sid_probe \
+  --encoder-ckpt $CKPT --wav-dir $VOX_WAV --split-file $VOX_SPLIT \
+  --output-dir runs/intact/probe_sid --max-steps 10000 --batch-size 32
 ```
 
 #### Bulk runner
@@ -132,7 +168,7 @@ uv run python -m src.eval.train_f0_probe \
 # All conditions × all tasks (skip-existing built in)
 bash scripts/run_all_probes.sh
 # Subset
-CONDITIONS="esc50 random_init" TASKS="boundary f0" bash scripts/run_all_probes.sh
+CONDITIONS="esc50 random_init" TASKS="ks sid" bash scripts/run_all_probes.sh
 ```
 
 ### 4. Aggregation
@@ -152,23 +188,29 @@ src/
 │   ├── midi_ops.py              # pitch / rhythm / both strip transforms
 │   ├── render_pop909.py         # POP909 MIDI -> wav (any transform)
 │   ├── prepare_esc50.py         # Resample ESC-50 to 16 kHz mono
+│   ├── prepare_speech_commands.py  # Download + extract Speech Commands v1
+│   ├── prepare_voxceleb.py      # Concat parts + extract VoxCeleb1 + fetch iden_split.txt
 │   ├── extract_f0.py            # F0 extraction for all LibriSpeech utts via pyworld
 │   ├── generate_examples.py     # Demo MIDI/WAV for the talk (1–2 bars)
 │   ├── dataset.py               # WavFolderDataset (for pretrain)
 │   ├── alignments.py            # MFA TextGrid phoneme-alignment parser
-│   └── librispeech.py           # LibriSpeech + frame-level phoneme/F0
+│   ├── librispeech.py           # LibriSpeech + frame-level phoneme/F0
+│   ├── speech_commands.py       # SUPERB KS dataset (12-class)
+│   └── voxceleb.py              # SUPERB SID dataset (iden_split, 1251 speakers)
 ├── models/
 │   ├── encoder.py               # mel + Transformer encoder
 │   └── msm.py                   # Masked Spectrogram Modeling
 ├── pretrain/train.py            # SSL pretrain
 └── eval/
-    ├── probe.py                 # frozen encoder + linear head
+    ├── probe.py                 # frozen encoder + linear / mean-pool heads
     ├── train_probe.py           # phoneme classification
     ├── train_boundary_probe.py  # phoneme boundary detection
-    └── train_f0_probe.py        # F0 tracking (regression)
+    ├── train_f0_probe.py        # F0 tracking (regression)
+    ├── train_ks_probe.py        # keyword spotting (utterance-level)
+    └── train_sid_probe.py       # speaker identification (utterance-level)
 
 scripts/
-├── run_seed_full.sh             # Full pipeline for 1 seed (5 pretrain + 18 probe)
+├── run_seed_full.sh             # Full pipeline for 1 seed (5 pretrain + 30 probe)
 └── run_all_probes.sh            # All conditions × all probes (skip-existing built in)
 
 examples/                        # 1–2 bar samples for the talk
@@ -184,3 +226,6 @@ notebooks/
 - CorentinJ/librispeech-alignments: https://github.com/CorentinJ/librispeech-alignments (TextGrid version used)
 - ESC-50: https://github.com/karolpiczak/ESC-50
 - WORLD (pyworld): https://github.com/JeremyCCHsu/Python-Wrapper-for-World-Vocoder
+- Speech Commands v0.01: https://arxiv.org/abs/1804.03209 (Warden, 2018)
+- VoxCeleb1: https://www.robots.ox.ac.uk/~vgg/data/voxceleb/vox1.html (Nagrani et al., 2017)
+- SUPERB: https://superbbenchmark.org/ (Yang et al., 2021)
